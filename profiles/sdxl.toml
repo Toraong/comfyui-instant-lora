@@ -41,9 +41,6 @@ noise_offset_random_strength = true
 mixed_precision = "bf16"
 sdpa = true
 xformers = false
-gradient_checkpointing = false
-cache_latents = true
-cache_text_encoder_outputs = true
 
 save_model_as = "safetensors"
 save_precision = "bf16"
