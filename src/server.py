@@ -25,7 +25,7 @@ def _profiles_dir() -> Path:
 
 def _cache_dirs() -> list[Path]:
     paths = get_runtime_paths()
-    return [paths.cache, paths.outputs, paths.datasets, paths.artifacts]
+    return [paths.cache, paths.generated_loras, paths.datasets, paths.artifacts]
 
 
 def _last_lora_info_path() -> Path:
@@ -75,6 +75,7 @@ def _cache_info_payload() -> dict[str, object]:
     profiles_dir = ensure_dir(_profiles_dir())
     return {
         "profiles_dir": str(profiles_dir),
+        "generated_loras_dir": str(get_runtime_paths().generated_loras),
         "total_bytes": total,
         "total_human": _format_bytes(total),
         "breakdown_bytes": breakdown,
@@ -177,7 +178,7 @@ async def instant_reference_lora_download(request):
         return web.json_response({"error": "Missing LoRA path."}, status=400)
 
     requested_path = Path(raw_path).expanduser().resolve()
-    outputs_root = get_runtime_paths().outputs.resolve()
+    outputs_root = get_runtime_paths().generated_loras.resolve()
     if not _is_path_within(outputs_root, requested_path):
         return web.json_response({"error": "Only cached LoRA files can be downloaded."}, status=400)
     if requested_path.suffix.lower() != ".safetensors":

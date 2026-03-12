@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import folder_paths
 from PIL import Image
 
 try:
@@ -211,18 +212,24 @@ class RuntimePaths:
     cache: Path
     datasets: Path
     outputs: Path
+    generated_loras: Path
     artifacts: Path
 
 
 def get_runtime_paths() -> RuntimePaths:
     root = ensure_dir(runtime_root())
+    lora_dirs = folder_paths.get_folder_paths("loras")
+    if not lora_dirs:
+        raise RuntimeError("No ComfyUI LoRA directories are registered.")
+    generated_loras = ensure_dir(Path(lora_dirs[0]) / "instant-reference-generated")
     return RuntimePaths(
         root=root,
         sd_scripts=root / "sd-scripts",
         venv=root / "venv",
         cache=ensure_dir(root / "cache"),
         datasets=ensure_dir(root / "datasets"),
-        outputs=ensure_dir(root / "outputs"),
+        outputs=generated_loras,
+        generated_loras=generated_loras,
         artifacts=ensure_dir(root / "artifacts"),
     )
 

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any
 import comfy.model_management
 import comfy.sd
 import comfy.utils
+import folder_paths
 from comfy_api.latest import ComfyExtension, io
 
 from .profiles import ProfileDefinition, SlotSpec, load_profiles, profile_map, profiles_fingerprint, replace_profile_tokens
@@ -32,9 +34,14 @@ from .runtime import (
 )
 
 
-NODE_VERSION = "0.1.3"
+NODE_VERSION = "0.1.4"
 MAX_TRAIN_STEPS_PATTERN = re.compile(r"^\s*max_train_steps\s*=\s*(\d+)\s*$", re.MULTILINE)
 MIXED_PRECISION_PATTERN = re.compile(r'^\s*mixed_precision\s*=\s*"([^"]+)"\s*$', re.MULTILINE)
+
+
+@io.comfytype(io_type="LORA_STACK")
+class LoRAStack(io.ComfyTypeIO):
+    Type = list[tuple[str, float, float]]
 
 
 @dataclass(frozen=True)
@@ -458,6 +465,31 @@ def _record_last_lora(lora_path: Path) -> None:
     )
 
 
+def _ensure_lora_stack_entry(lora_path: Path, model_strength: float, clip_strength: float) -> list[tuple[str, float, float]]:
+    lora_dirs = [Path(path) for path in folder_paths.get_folder_paths("loras")]
+    for root in lora_dirs:
+        try:
+            relative = lora_path.resolve().relative_to(root.resolve())
+            return [(relative.as_posix(), model_strength, clip_strength)]
+        except ValueError:
+            continue
+
+    if not lora_dirs:
+        raise RuntimeError("No ComfyUI LoRA directories are registered.")
+
+    generated_dir = ensure_dir(lora_dirs[0] / "instant-reference-generated")
+    target_path = generated_dir / lora_path.name
+    if (
+        not target_path.exists()
+        or target_path.stat().st_size != lora_path.stat().st_size
+        or target_path.stat().st_mtime < lora_path.stat().st_mtime
+    ):
+        shutil.copy2(lora_path, target_path)
+
+    relative = target_path.relative_to(lora_dirs[0]).as_posix()
+    return [(relative, model_strength, clip_strength)]
+
+
 class InstantReferenceLoRA(io.ComfyNode):
     CATEGORY = "reference/training"
 
@@ -484,6 +516,7 @@ class InstantReferenceLoRA(io.ComfyNode):
                 io.Model.Output(display_name="model"),
                 io.Clip.Output(display_name="clip"),
                 io.String.Output(display_name="lora_path"),
+                LoRAStack.Output(display_name="lora_stack"),
             ],
         )
 
@@ -590,7 +623,8 @@ def _execute_reference_lora(model, clip, images, profile, model_strength=1.0, cl
             float(clip_strength),
         )
         _record_last_lora(cached_lora)
-        return io.NodeOutput(patched_model, patched_clip, str(cached_lora))
+        lora_stack = _ensure_lora_stack_entry(cached_lora, float(model_strength), float(clip_strength))
+        return io.NodeOutput(patched_model, patched_clip, str(cached_lora), lora_stack)
 
 
 class ReferenceTrainingExtension(ComfyExtension):
@@ -619,8 +653,8 @@ def _all_optional_profile_inputs() -> dict[str, tuple]:
 
 class InstantReferenceLoRAV1:
     CATEGORY = "reference/training"
-    RETURN_TYPES = ("MODEL", "CLIP", "STRING")
-    RETURN_NAMES = ("model", "clip", "lora_path")
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "LORA_STACK")
+    RETURN_NAMES = ("model", "clip", "lora_path", "lora_stack")
     FUNCTION = "run"
 
     @classmethod
