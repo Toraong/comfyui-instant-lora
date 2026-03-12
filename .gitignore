@@ -14,5 +14,6 @@ runtime/
 ComfyUI-upstream/
 
 *.log
+node.zip
 Thumbs.db
 .DS_Store
