@@ -5,6 +5,16 @@ A custom node for ComfyUI that turns a reference image set into a quick LoRA and
 It is aimed at fast character or style adaptation runs with minimal setup. The node prepares captions, runs a lightweight training profile, caches matching runs, and reuses the generated LoRA when possible.
 Under the hood, it uses `sd-scripts` for tagging and LoRA training.
 
+This node is still fairly rough and has only been tested with simple workflows so far. If you run into issues, please open an issue with your workflow details and logs.
+
+## Example
+
+![Reference adaptation example](./assets/readme-example.png)
+
+## Workflow Example
+
+![Workflow example](./assets/workflows.png)
+
 ## Nodes
 
 ### Instant Reference LoRA
