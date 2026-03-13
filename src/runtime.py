@@ -29,7 +29,7 @@ if os.name == "nt":
     from ctypes import wintypes
 
 
-SETUP_VERSION = "11"
+SETUP_VERSION = "12"
 SD_SCRIPTS_REPO = "https://github.com/kohya-ss/sd-scripts.git"
 SD_SCRIPTS_COMMIT = "1a3ec9ea745fe9883551dfca5c947ea3d6aa68c7"
 
@@ -191,6 +191,59 @@ def ensure_uv(paths: RuntimePaths, log_path: Path | None = None) -> str:
 
 def runtime_project_dir() -> Path:
     return plugin_root() / "runtime_env"
+
+
+def python_version_tuple(python_executable: str | Path) -> tuple[int, int] | None:
+    try:
+        result = subprocess.run(
+            [str(python_executable), "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    version_text = result.stdout.strip()
+    try:
+        major_text, minor_text = version_text.split(".", 1)
+        return int(major_text), int(minor_text)
+    except ValueError:
+        return None
+
+
+def resolve_runtime_python() -> str:
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["py", "-3.12", "-c", "import sys; print(sys.executable)"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                "Python 3.12 is required for the instant-reference runtime on Windows, "
+                "but the Python launcher `py` is not available."
+            ) from exc
+
+        if result.returncode == 0:
+            candidate = result.stdout.strip()
+            if candidate and Path(candidate).exists():
+                return candidate
+
+        raise RuntimeError(
+            "Python 3.12 is required for the instant-reference runtime on Windows. Install Python 3.12."
+        )
+
+    return sys.executable
 
 
 def runtime_imports_ready(python_path: Path) -> bool:
@@ -421,6 +474,24 @@ def venv_python(venv_dir: Path) -> Path:
     return venv_dir / "bin" / "python"
 
 
+def recreate_venv_if_needed(paths: RuntimePaths, target_python: str, uv: str, log_path: Path | None = None) -> Path:
+    python_path = venv_python(paths.venv)
+    target_version = python_version_tuple(target_python)
+    venv_version = python_version_tuple(python_path) if python_path.exists() else None
+
+    if not python_path.exists() or (target_version is not None and venv_version != target_version):
+        if paths.venv.exists():
+            shutil.rmtree(paths.venv, ignore_errors=True)
+        run_command(
+            [uv, "venv", "--python", target_python, "--system-site-packages", str(paths.venv)],
+            cwd=paths.root,
+            log_path=log_path,
+        )
+        python_path = venv_python(paths.venv)
+
+    return python_path
+
+
 def ensure_sd_scripts_checkout(paths: RuntimePaths, log_path: Path | None = None) -> None:
     if not paths.sd_scripts.exists():
         run_command(
@@ -433,14 +504,9 @@ def ensure_sd_scripts_checkout(paths: RuntimePaths, log_path: Path | None = None
 def ensure_sd_scripts_environment(paths: RuntimePaths, log_path: Path | None = None) -> None:
     ensure_sd_scripts_checkout(paths, log_path=log_path)
 
-    python_path = venv_python(paths.venv)
     uv = ensure_uv(paths, log_path=log_path)
-    if not python_path.exists():
-        run_command(
-            [uv, "venv", "--python", sys.executable, "--system-site-packages", str(paths.venv)],
-            cwd=paths.root,
-            log_path=log_path,
-        )
+    runtime_python = resolve_runtime_python()
+    python_path = recreate_venv_if_needed(paths, runtime_python, uv, log_path=log_path)
 
     marker = paths.venv / ".sd_scripts_ready"
     if marker.exists():
@@ -451,12 +517,15 @@ def ensure_sd_scripts_environment(paths: RuntimePaths, log_path: Path | None = N
     sync_env.setdefault("PYTHONUTF8", "1")
     sync_env.setdefault("PYTHONIOENCODING", "utf-8")
     sync_env["VIRTUAL_ENV"] = str(paths.venv)
+    sync_env["UV_PYTHON"] = str(python_path)
     scripts_dir = python_path.parent
     sync_env["PATH"] = str(scripts_dir) + os.pathsep + sync_env.get("PATH", "")
     run_command(
         [
             uv,
             "sync",
+            "--python",
+            str(python_path),
             "--active",
             "--project",
             str(runtime_project_dir()),
