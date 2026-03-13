@@ -14,6 +14,7 @@ This node is still fairly rough and has only been tested with simple workflows s
 ## Workflow Example
 
 ![Workflow example](./assets/workflows.png)
+Drop `assets/workflows.png` into ComfyUI to load the included SDXL example workflow.
 
 ## Nodes
 
