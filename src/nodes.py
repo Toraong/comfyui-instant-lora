@@ -72,6 +72,10 @@ class LoRAStack(io.ComfyTypeIO):
     Type = list[tuple[str, float, float]]
 
 
+TaggingOptionsIO = io.Custom("TAGGING_OPTIONS")
+TrainOptionsIO = io.Custom("TRAIN_OPTIONS")
+
+
 @dataclass(frozen=True)
 class ResolvedSlot:
     name: str
@@ -120,34 +124,45 @@ def _split_tags(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-def _tagging_options_from_input(value: Any | None) -> TaggingOptions:
+def _unwrap_options_input(value: Any | None, key: str) -> dict[str, Any]:
     if not value:
-        return TaggingOptions()
+        return {}
+    if isinstance(value, dict):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            return nested
+        return value
+    if isinstance(value, (list, tuple)) and len(value) == 1 and isinstance(value[0], dict):
+        return _unwrap_options_input(value[0], key)
+    return {}
+
+
+def _tagging_options_from_input(value: Any | None) -> TaggingOptions:
+    resolved = _unwrap_options_input(value, "tagging_options")
     return TaggingOptions(
-        general_threshold=float(value.get("general_threshold", 0.35)),
-        character_threshold=float(value.get("character_threshold", 0.85)),
-        prepend_tags=str(value.get("prepend_tags", "")),
-        append_tags=str(value.get("append_tags", "")),
-        exclude_tags=str(value.get("exclude_tags", "")),
-        replace_tags=str(value.get("replace_tags", "")),
-        remove_underscore=bool(value.get("remove_underscore", True)),
+        general_threshold=float(resolved.get("general_threshold", 0.35)),
+        character_threshold=float(resolved.get("character_threshold", 0.85)),
+        prepend_tags=str(resolved.get("prepend_tags", "")),
+        append_tags=str(resolved.get("append_tags", "")),
+        exclude_tags=str(resolved.get("exclude_tags", "")),
+        replace_tags=str(resolved.get("replace_tags", "")),
+        remove_underscore=bool(resolved.get("remove_underscore", True)),
     )
 
 
 def _train_options_from_input(value: Any | None) -> TrainOptions:
-    if not value:
-        return TrainOptions()
+    resolved = _unwrap_options_input(value, "train_options")
     return TrainOptions(
-        steps_override=int(value.get("steps_override", 0)),
-        learning_rate_override=float(value.get("learning_rate_override", 0.0)),
-        network_dim_override=int(value.get("network_dim_override", 0)),
-        network_alpha_override=int(value.get("network_alpha_override", 0)),
-        resolution_override=str(value.get("resolution_override", "")),
-        gradient_checkpointing=bool(value.get("gradient_checkpointing", True)),
-        cache_latents=bool(value.get("cache_latents", True)),
-        cache_text_encoder_outputs=bool(value.get("cache_text_encoder_outputs", True)),
-        seed_override=int(value.get("seed_override", -1)),
-        force_retrain=bool(value.get("force_retrain", False)),
+        steps_override=int(resolved.get("steps_override", 0)),
+        learning_rate_override=float(resolved.get("learning_rate_override", 0.0)),
+        network_dim_override=int(resolved.get("network_dim_override", 0)),
+        network_alpha_override=int(resolved.get("network_alpha_override", 0)),
+        resolution_override=str(resolved.get("resolution_override", "")),
+        gradient_checkpointing=bool(resolved.get("gradient_checkpointing", True)),
+        cache_latents=bool(resolved.get("cache_latents", True)),
+        cache_text_encoder_outputs=bool(resolved.get("cache_text_encoder_outputs", True)),
+        seed_override=int(resolved.get("seed_override", -1)),
+        force_retrain=bool(resolved.get("force_retrain", False)),
     )
 
 
@@ -294,7 +309,8 @@ def _tag_dataset(paths, dataset_dir: Path, log_path: Path, options: TaggingOptio
         command.extend(["--tag_replacement", options.replace_tags])
     if not onnx_model_path.exists():
         command.append("--force_download")
-    run_command(command, cwd=paths.sd_scripts, log_path=log_path)
+    env = {"PYTHONPATH": str(paths.sd_scripts)}
+    run_command(command, cwd=paths.sd_scripts, log_path=log_path, env=env)
 
 
 def _apply_caption_options(dataset_dir: Path, options: TaggingOptions) -> dict[str, str]:
@@ -479,7 +495,8 @@ def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, c
         if mixed_precision is not None:
             command.extend(["--mixed_precision", mixed_precision])
     command.extend([str(training_script), "--config_file", str(config_path)])
-    run_command(command, cwd=paths.sd_scripts, log_path=log_path)
+    env = {"PYTHONPATH": str(paths.sd_scripts)}
+    run_command(command, cwd=paths.sd_scripts, log_path=log_path, env=env)
     trained_lora = latest_safetensors(output_dir)
     if trained_lora is None:
         raise RuntimeError(f"Training completed but no LoRA file was found in {output_dir}")
@@ -592,6 +609,8 @@ class InstantReferenceLoRA(io.ComfyNode):
                 io.Float.Input("model_strength", default=1.0),
                 io.Float.Input("clip_strength", default=1.0),
                 io.DynamicCombo.Input("profile", options=options, display_name="profile"),
+                TaggingOptionsIO.Input("tagging_options", optional=True),
+                TrainOptionsIO.Input("train_options", optional=True),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -761,6 +780,8 @@ class InstantReferenceLoRATrain(io.ComfyNode):
                 io.Clip.Input("clip"),
                 io.Image.Input("images"),
                 io.DynamicCombo.Input("profile", options=options, display_name="profile"),
+                TaggingOptionsIO.Input("tagging_options", optional=True),
+                TrainOptionsIO.Input("train_options", optional=True),
             ],
             outputs=[
                 LoRAStack.Output(display_name="lora_stack"),
