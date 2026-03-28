@@ -5,7 +5,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,10 +22,10 @@ from .runtime import (
     ensure_sd_scripts_environment,
     export_images,
     get_runtime_paths,
-    hash_file,
     hash_tensor_batch,
     hash_text,
     latest_safetensors,
+    move_into_artifacts,
     read_caption_files,
     resolve_sd_scripts_file,
     run_command,
@@ -35,34 +34,7 @@ from .runtime import (
 )
 
 
-def _read_project_version() -> str:
-    pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
-    content = pyproject_path.read_text(encoding="utf-8")
-    match = re.search(r'^version\s*=\s*"([^"]+)"\s*$', content, re.MULTILINE)
-    if not match:
-        raise RuntimeError(f"Could not find project version in {pyproject_path}")
-    version = match.group(1)
-    if version != "0.0.0":
-        return version
-
-    git_dir = pyproject_path.parent / ".git"
-    if not git_dir.exists():
-        return version
-
-    try:
-        git_sha = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=pyproject_path.parent,
-            text=True,
-            encoding="utf-8",
-        ).strip()
-    except Exception:
-        return version
-
-    return f"{version}+{git_sha}" if git_sha else version
-
-
-NODE_VERSION = _read_project_version()
+NODE_VERSION = "0.1.4"
 MAX_TRAIN_STEPS_PATTERN = re.compile(r"^\s*max_train_steps\s*=\s*(\d+)\s*$", re.MULTILINE)
 MIXED_PRECISION_PATTERN = re.compile(r'^\s*mixed_precision\s*=\s*"([^"]+)"\s*$', re.MULTILINE)
 
@@ -70,10 +42,6 @@ MIXED_PRECISION_PATTERN = re.compile(r'^\s*mixed_precision\s*=\s*"([^"]+)"\s*$',
 @io.comfytype(io_type="LORA_STACK")
 class LoRAStack(io.ComfyTypeIO):
     Type = list[tuple[str, float, float]]
-
-
-TaggingOptionsIO = io.Custom("TAGGING_OPTIONS")
-TrainOptionsIO = io.Custom("TRAIN_OPTIONS")
 
 
 @dataclass(frozen=True)
@@ -124,45 +92,34 @@ def _split_tags(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-def _unwrap_options_input(value: Any | None, key: str) -> dict[str, Any]:
-    if not value:
-        return {}
-    if isinstance(value, dict):
-        nested = value.get(key)
-        if isinstance(nested, dict):
-            return nested
-        return value
-    if isinstance(value, (list, tuple)) and len(value) == 1 and isinstance(value[0], dict):
-        return _unwrap_options_input(value[0], key)
-    return {}
-
-
 def _tagging_options_from_input(value: Any | None) -> TaggingOptions:
-    resolved = _unwrap_options_input(value, "tagging_options")
+    if not value:
+        return TaggingOptions()
     return TaggingOptions(
-        general_threshold=float(resolved.get("general_threshold", 0.35)),
-        character_threshold=float(resolved.get("character_threshold", 0.85)),
-        prepend_tags=str(resolved.get("prepend_tags", "")),
-        append_tags=str(resolved.get("append_tags", "")),
-        exclude_tags=str(resolved.get("exclude_tags", "")),
-        replace_tags=str(resolved.get("replace_tags", "")),
-        remove_underscore=bool(resolved.get("remove_underscore", True)),
+        general_threshold=float(value.get("general_threshold", 0.35)),
+        character_threshold=float(value.get("character_threshold", 0.85)),
+        prepend_tags=str(value.get("prepend_tags", "")),
+        append_tags=str(value.get("append_tags", "")),
+        exclude_tags=str(value.get("exclude_tags", "")),
+        replace_tags=str(value.get("replace_tags", "")),
+        remove_underscore=bool(value.get("remove_underscore", True)),
     )
 
 
 def _train_options_from_input(value: Any | None) -> TrainOptions:
-    resolved = _unwrap_options_input(value, "train_options")
+    if not value:
+        return TrainOptions()
     return TrainOptions(
-        steps_override=int(resolved.get("steps_override", 0)),
-        learning_rate_override=float(resolved.get("learning_rate_override", 0.0)),
-        network_dim_override=int(resolved.get("network_dim_override", 0)),
-        network_alpha_override=int(resolved.get("network_alpha_override", 0)),
-        resolution_override=str(resolved.get("resolution_override", "")),
-        gradient_checkpointing=bool(resolved.get("gradient_checkpointing", True)),
-        cache_latents=bool(resolved.get("cache_latents", True)),
-        cache_text_encoder_outputs=bool(resolved.get("cache_text_encoder_outputs", True)),
-        seed_override=int(resolved.get("seed_override", -1)),
-        force_retrain=bool(resolved.get("force_retrain", False)),
+        steps_override=int(value.get("steps_override", 0)),
+        learning_rate_override=float(value.get("learning_rate_override", 0.0)),
+        network_dim_override=int(value.get("network_dim_override", 0)),
+        network_alpha_override=int(value.get("network_alpha_override", 0)),
+        resolution_override=str(value.get("resolution_override", "")),
+        gradient_checkpointing=bool(value.get("gradient_checkpointing", True)),
+        cache_latents=bool(value.get("cache_latents", True)),
+        cache_text_encoder_outputs=bool(value.get("cache_text_encoder_outputs", True)),
+        seed_override=int(value.get("seed_override", -1)),
+        force_retrain=bool(value.get("force_retrain", False)),
     )
 
 
@@ -239,41 +196,34 @@ def _export_state_dict_artifact(state_dict: dict[str, Any], suffix: str) -> tupl
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=paths.artifacts) as handle:
         temp_path = Path(handle.name)
     comfy.utils.save_torch_file(state_dict, str(temp_path))
-    return hash_file(temp_path), temp_path
+    return move_into_artifacts(temp_path, paths.artifacts, suffix)
 
 
-def _resolve_clip_slot(name: str, value: Any, ephemeral_artifacts: list[Path]) -> ResolvedSlot:
+def _resolve_clip_slot(name: str, value: Any) -> ResolvedSlot:
     try:
         clip_paths = _recover_clip_paths(value)
         fingerprint = hash_text("|".join(clip_paths))
         return ResolvedSlot(name=name, replacement=clip_paths[0], fingerprint=fingerprint)
     except Exception:
         digest, exported_path = _export_state_dict_artifact(value.get_sd(), ".safetensors")
-        ephemeral_artifacts.append(exported_path)
         return ResolvedSlot(name=name, replacement=str(exported_path), fingerprint=digest)
 
 
-def _resolve_vae_slot(name: str, value: Any, ephemeral_artifacts: list[Path]) -> ResolvedSlot:
+def _resolve_vae_slot(name: str, value: Any) -> ResolvedSlot:
     digest, exported_path = _export_state_dict_artifact(value.get_sd(), ".safetensors")
-    ephemeral_artifacts.append(exported_path)
     return ResolvedSlot(name=name, replacement=str(exported_path), fingerprint=digest)
 
 
-def _resolve_slot(slot: SlotSpec, raw_value: Any, ephemeral_artifacts: list[Path]) -> ResolvedSlot:
+def _resolve_slot(slot: SlotSpec, raw_value: Any) -> ResolvedSlot:
     if slot.slot_type == "STRING":
         return _resolve_string_slot(slot.name, raw_value)
     if slot.slot_type == "MODEL":
         return _resolve_model_slot(slot.name, raw_value)
     if slot.slot_type == "CLIP":
-        return _resolve_clip_slot(slot.name, raw_value, ephemeral_artifacts)
+        return _resolve_clip_slot(slot.name, raw_value)
     if slot.slot_type == "VAE":
-        return _resolve_vae_slot(slot.name, raw_value, ephemeral_artifacts)
+        return _resolve_vae_slot(slot.name, raw_value)
     raise RuntimeError(f"Unsupported slot type: {slot.slot_type}")
-
-
-def _cleanup_ephemeral_artifacts(paths: list[Path]) -> None:
-    for path in paths:
-        path.unlink(missing_ok=True)
 
 
 def _tag_dataset(paths, dataset_dir: Path, log_path: Path, options: TaggingOptions) -> None:
@@ -309,8 +259,7 @@ def _tag_dataset(paths, dataset_dir: Path, log_path: Path, options: TaggingOptio
         command.extend(["--tag_replacement", options.replace_tags])
     if not onnx_model_path.exists():
         command.append("--force_download")
-    env = {"PYTHONPATH": str(paths.sd_scripts)}
-    run_command(command, cwd=paths.sd_scripts, log_path=log_path, env=env)
+    run_command(command, cwd=paths.sd_scripts, log_path=log_path)
 
 
 def _apply_caption_options(dataset_dir: Path, options: TaggingOptions) -> dict[str, str]:
@@ -347,7 +296,7 @@ def _prepare_dataset(
     captions = _apply_caption_options(train_subset_dir, options)
     if not captions:
         raise RuntimeError("WD tagging did not produce any caption files.")
-    caption_digest = hashlib.sha256()
+    caption_digest = hashlib.blake2b(digest_size=4)
     for key, value in sorted(captions.items()):
         caption_digest.update(key.encode("utf-8"))
         caption_digest.update(value.encode("utf-8"))
@@ -376,7 +325,7 @@ def _cache_key(
     tagging_options: TaggingOptions,
     train_options: TrainOptions,
 ) -> str:
-    digest = hashlib.sha256()
+    digest = hashlib.blake2b(digest_size=4)
     digest.update(NODE_VERSION.encode("utf-8"))
     digest.update(checkpoint_path.encode("utf-8"))
     digest.update(profile.file_hash.encode("utf-8"))
@@ -495,8 +444,7 @@ def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, c
         if mixed_precision is not None:
             command.extend(["--mixed_precision", mixed_precision])
     command.extend([str(training_script), "--config_file", str(config_path)])
-    env = {"PYTHONPATH": str(paths.sd_scripts)}
-    run_command(command, cwd=paths.sd_scripts, log_path=log_path, env=env)
+    run_command(command, cwd=paths.sd_scripts, log_path=log_path)
     trained_lora = latest_safetensors(output_dir)
     if trained_lora is None:
         raise RuntimeError(f"Training completed but no LoRA file was found in {output_dir}")
@@ -506,52 +454,6 @@ def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, c
 def _apply_lora(model: Any, clip: Any, lora_path: Path, model_strength: float, clip_strength: float) -> tuple[Any, Any]:
     lora = comfy.utils.load_torch_file(str(lora_path), safe_load=True)
     return comfy.sd.load_lora_for_models(model, clip, lora, model_strength, clip_strength)
-
-
-def _resolve_lora_stack_paths(lora_stack: Any) -> list[tuple[Path, float, float]]:
-    if not lora_stack:
-        raise RuntimeError("LoRA stack is empty. Connect a trained LoRA stack first.")
-
-    lora_dirs = [Path(path) for path in folder_paths.get_folder_paths("loras")]
-    resolved: list[tuple[Path, float, float]] = []
-    for entry in lora_stack:
-        if not isinstance(entry, (list, tuple)) or len(entry) != 3:
-            raise RuntimeError("LoRA stack entries must be (name, model_strength, clip_strength).")
-        name, model_strength, clip_strength = entry
-        if not isinstance(name, str) or not name.strip():
-            raise RuntimeError("LoRA stack entry path was missing.")
-
-        candidate = Path(name)
-        resolved_path: Path | None = None
-        if candidate.is_absolute() and candidate.exists():
-            resolved_path = candidate
-        else:
-            normalized_name = name.replace("/", os.sep).replace("\\", os.sep)
-            for root in lora_dirs:
-                maybe_path = (root / normalized_name).resolve()
-                if maybe_path.exists() and maybe_path.is_file():
-                    resolved_path = maybe_path
-                    break
-
-        if resolved_path is None:
-            raise RuntimeError(f"Could not find LoRA '{name}' in registered ComfyUI LoRA directories.")
-
-        resolved.append((resolved_path, float(model_strength), float(clip_strength)))
-    return resolved
-
-
-def _apply_lora_stack(model: Any, clip: Any, lora_stack: Any) -> tuple[Any, Any, list[tuple[str, float, float]]]:
-    patched_model = model
-    patched_clip = clip
-    for lora_path, model_strength, clip_strength in _resolve_lora_stack_paths(lora_stack):
-        patched_model, patched_clip = _apply_lora(
-            patched_model,
-            patched_clip,
-            lora_path,
-            model_strength,
-            clip_strength,
-        )
-    return patched_model, patched_clip, list(lora_stack)
 
 
 def _record_last_lora(lora_path: Path) -> None:
@@ -575,7 +477,7 @@ def _ensure_lora_stack_entry(lora_path: Path, model_strength: float, clip_streng
     if not lora_dirs:
         raise RuntimeError("No ComfyUI LoRA directories are registered.")
 
-    generated_dir = ensure_dir(lora_dirs[0] / "instant-reference-generated")
+    generated_dir = ensure_dir(lora_dirs[0] / "0instant")
     target_path = generated_dir / lora_path.name
     if (
         not target_path.exists()
@@ -609,14 +511,13 @@ class InstantReferenceLoRA(io.ComfyNode):
                 io.Float.Input("model_strength", default=1.0),
                 io.Float.Input("clip_strength", default=1.0),
                 io.DynamicCombo.Input("profile", options=options, display_name="profile"),
-                TaggingOptionsIO.Input("tagging_options", optional=True),
-                TrainOptionsIO.Input("train_options", optional=True),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
                 io.Clip.Output(display_name="clip"),
                 io.String.Output(display_name="lora_path"),
                 LoRAStack.Output(display_name="lora_stack"),
+                io.String.Output(display_name="tags"), # <--- 태그 출력 추가
             ],
         )
 
@@ -639,9 +540,7 @@ class InstantReferenceLoRA(io.ComfyNode):
         )
 
 
-def _train_reference_lora(model, clip, images, profile, tagging_options=None, train_options=None) -> Path:
-    ephemeral_artifacts: list[Path] = []
-    try:
+def _execute_reference_lora(model, clip, images, profile, model_strength=1.0, clip_strength=1.0, tagging_options=None, train_options=None) -> io.NodeOutput:
         profile_key = profile["profile"]
         selected_profile = profile_map(_plugin_root())[profile_key]
         resolved_tagging = _tagging_options_from_input(tagging_options)
@@ -662,17 +561,21 @@ def _train_reference_lora(model, clip, images, profile, tagging_options=None, tr
             target_steps=target_steps,
         )
 
+        # 2. 캡션 파일들의 내용을 하나의 문자열로 합치기 (출력용)
+        # 각 이미지별 태그를 줄바꿈하여 합칩니다. (파일명 제외)
+        all_tags_text = "\n".join([v for k, v in captions.items()])
+
         resolved_slots: dict[str, ResolvedSlot] = {}
         for slot in selected_profile.slots:
             if slot.slot_type == "MODEL":
-                resolved_slots[slot.name] = _resolve_slot(slot, model, ephemeral_artifacts)
+                resolved_slots[slot.name] = _resolve_slot(slot, model)
                 continue
             if slot.slot_type == "CLIP":
-                resolved_slots[slot.name] = _resolve_slot(slot, clip, ephemeral_artifacts)
+                resolved_slots[slot.name] = _resolve_slot(slot, clip)
                 continue
             if slot.name not in profile:
                 raise RuntimeError(f"Profile '{selected_profile.name}' requires input '{slot.name}'.")
-            resolved_slots[slot.name] = _resolve_slot(slot, profile[slot.name], ephemeral_artifacts)
+            resolved_slots[slot.name] = _resolve_slot(slot, profile[slot.name])
 
         cache_key = _cache_key(
             checkpoint_path=checkpoint_path,
@@ -689,7 +592,7 @@ def _train_reference_lora(model, clip, images, profile, tagging_options=None, tr
         if temp_run_log != run_log:
             _merge_run_log(temp_run_log, run_log)
         output_dir = ensure_dir(paths.outputs / cache_key)
-        output_name = f"instant_lora_{cache_key[:12]}"
+        output_name = f"instant_{cache_key[:12]}"
         manifest = run_dir / "manifest.json"
         cached_lora = None if resolved_train.force_retrain else latest_safetensors(output_dir)
 
@@ -717,123 +620,21 @@ def _train_reference_lora(model, clip, images, profile, tagging_options=None, tr
                 soft_empty_cache()
             cached_lora = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log)
 
-        _record_last_lora(cached_lora)
-        return cached_lora
-    finally:
-        _cleanup_ephemeral_artifacts(ephemeral_artifacts)
-
-
-def _execute_reference_train(model, clip, images, profile, tagging_options=None, train_options=None) -> io.NodeOutput:
-    trained_lora = _train_reference_lora(
-        model,
-        clip,
-        images,
-        profile,
-        tagging_options=tagging_options,
-        train_options=train_options,
-    )
-    lora_stack = _ensure_lora_stack_entry(trained_lora, 1.0, 1.0)
-    return io.NodeOutput(lora_stack)
-
-
-def _execute_reference_apply(model, clip, lora_stack) -> io.NodeOutput:
-    patched_model, patched_clip, output_stack = _apply_lora_stack(model, clip, lora_stack)
-    return io.NodeOutput(patched_model, patched_clip, output_stack)
-
-
-def _execute_reference_lora(model, clip, images, profile, model_strength=1.0, clip_strength=1.0, tagging_options=None, train_options=None) -> io.NodeOutput:
-    trained_lora = _train_reference_lora(
-        model,
-        clip,
-        images,
-        profile,
-        tagging_options=tagging_options,
-        train_options=train_options,
-    )
-    patched_model, patched_clip = _apply_lora(
-        model,
-        clip,
-        trained_lora,
-        float(model_strength),
-        float(clip_strength),
-    )
-    lora_stack = _ensure_lora_stack_entry(trained_lora, float(model_strength), float(clip_strength))
-    return io.NodeOutput(patched_model, patched_clip, str(trained_lora), lora_stack)
-
-
-class InstantReferenceLoRATrain(io.ComfyNode):
-    CATEGORY = "reference/training"
-
-    @classmethod
-    def define_schema(cls) -> io.Schema:
-        profiles = load_profiles(_plugin_root())
-        options = [
-            io.DynamicCombo.Option(profile.key, _profile_choice_inputs(profile))
-            for profile in profiles
-        ]
-        return io.Schema(
-            node_id="InstantReferenceLoRATrain",
-            display_name="Instant Reference LoRA Train",
-            category=cls.CATEGORY,
-            inputs=[
-                io.Model.Input("model"),
-                io.Clip.Input("clip"),
-                io.Image.Input("images"),
-                io.DynamicCombo.Input("profile", options=options, display_name="profile"),
-                TaggingOptionsIO.Input("tagging_options", optional=True),
-                TrainOptionsIO.Input("train_options", optional=True),
-            ],
-            outputs=[
-                LoRAStack.Output(display_name="lora_stack"),
-            ],
-        )
-
-    @classmethod
-    def fingerprint_inputs(cls, model=None, clip=None, images=None, profile=None):
-        profiles = load_profiles(_plugin_root())
-        return profiles_fingerprint(profiles)
-
-    @classmethod
-    def execute(cls, model, clip, images, profile, tagging_options=None, train_options=None) -> io.NodeOutput:
-        return _execute_reference_train(
+        patched_model, patched_clip = _apply_lora(
             model,
             clip,
-            images,
-            profile,
-            tagging_options=tagging_options,
-            train_options=train_options,
+            cached_lora,
+            float(model_strength),
+            float(clip_strength),
         )
-
-
-class InstantReferenceLoRAApply(io.ComfyNode):
-    CATEGORY = "reference/training"
-
-    @classmethod
-    def define_schema(cls) -> io.Schema:
-        return io.Schema(
-            node_id="InstantReferenceLoRAApply",
-            display_name="Instant Reference LoRA Apply",
-            category=cls.CATEGORY,
-            inputs=[
-                io.Model.Input("model"),
-                io.Clip.Input("clip"),
-                LoRAStack.Input("lora_stack"),
-            ],
-            outputs=[
-                io.Model.Output(display_name="model"),
-                io.Clip.Output(display_name="clip"),
-                LoRAStack.Output(display_name="lora_stack"),
-            ],
-        )
-
-    @classmethod
-    def execute(cls, model, clip, lora_stack) -> io.NodeOutput:
-        return _execute_reference_apply(model, clip, lora_stack)
+        _record_last_lora(cached_lora)
+        lora_stack = _ensure_lora_stack_entry(cached_lora, float(model_strength), float(clip_strength))
+        return io.NodeOutput(patched_model, patched_clip, str(cached_lora), lora_stack, all_tags_text)
 
 
 class ReferenceTrainingExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [InstantReferenceLoRA, InstantReferenceLoRATrain, InstantReferenceLoRAApply]
+        return [InstantReferenceLoRA]
 
 
 def _v1_slot_type(slot_type: str):
@@ -857,8 +658,8 @@ def _all_optional_profile_inputs() -> dict[str, tuple]:
 
 class InstantReferenceLoRAV1:
     CATEGORY = "reference/training"
-    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "LORA_STACK")
-    RETURN_NAMES = ("model", "clip", "lora_path", "lora_stack")
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "LORA_STACK", "STRING")
+    RETURN_NAMES = ("model", "clip", "lora_path", "lora_stack", "tags")
     FUNCTION = "run"
 
     @classmethod
@@ -893,64 +694,6 @@ class InstantReferenceLoRAV1:
             tagging_options=tagging_options,
             train_options=train_options,
         )
-        return output.result
-
-
-class InstantReferenceLoRATrainV1:
-    CATEGORY = "reference/training"
-    RETURN_TYPES = ("LORA_STACK",)
-    RETURN_NAMES = ("lora_stack",)
-    FUNCTION = "run"
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        profiles = load_profiles(_plugin_root())
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "clip": ("CLIP",),
-                "images": ("IMAGE",),
-                "profile": ([profile.key for profile in profiles],),
-            },
-            "optional": {
-                **_all_optional_profile_inputs(),
-                "tagging_options": ("TAGGING_OPTIONS",),
-                "train_options": ("TRAIN_OPTIONS",),
-            },
-        }
-
-    def run(self, model, clip, images, profile, tagging_options=None, train_options=None, **kwargs):
-        payload = {"profile": profile}
-        payload.update(kwargs)
-        output = _execute_reference_train(
-            model,
-            clip,
-            images,
-            payload,
-            tagging_options=tagging_options,
-            train_options=train_options,
-        )
-        return output.result
-
-
-class InstantReferenceLoRAApplyV1:
-    CATEGORY = "reference/training"
-    RETURN_TYPES = ("MODEL", "CLIP", "LORA_STACK")
-    RETURN_NAMES = ("model", "clip", "lora_stack")
-    FUNCTION = "run"
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "clip": ("CLIP",),
-                "lora_stack": ("LORA_STACK",),
-            },
-        }
-
-    def run(self, model, clip, lora_stack):
-        output = _execute_reference_apply(model, clip, lora_stack)
         return output.result
 
 
@@ -1007,16 +750,12 @@ class TrainOptionsV1:
 
 NODE_CLASS_MAPPINGS = {
     "InstantReferenceLoRA": InstantReferenceLoRAV1,
-    "InstantReferenceLoRATrain": InstantReferenceLoRATrainV1,
-    "InstantReferenceLoRAApply": InstantReferenceLoRAApplyV1,
     "ReferenceTaggingOptions": TaggingOptionsV1,
     "ReferenceTrainOptions": TrainOptionsV1,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "InstantReferenceLoRA": "Instant Reference LoRA",
-    "InstantReferenceLoRATrain": "Instant Reference LoRA Train",
-    "InstantReferenceLoRAApply": "Instant Reference LoRA Apply",
     "ReferenceTaggingOptions": "Reference Tagging Options",
     "ReferenceTrainOptions": "Reference Train Options",
 }
