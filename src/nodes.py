@@ -74,6 +74,7 @@ class TrainOptions:
     cache_text_encoder_outputs: bool = True
     seed_override: int = -1
     force_retrain: bool = False
+    output_name_override: str = ""
 
 
 def _plugin_root() -> Path:
@@ -120,6 +121,7 @@ def _train_options_from_input(value: Any | None) -> TrainOptions:
         cache_text_encoder_outputs=bool(value.get("cache_text_encoder_outputs", True)),
         seed_override=int(value.get("seed_override", -1)),
         force_retrain=bool(value.get("force_retrain", False)),
+        output_name_override=str(value.get("output_name", "")),
     )
 
 
@@ -477,7 +479,7 @@ def _ensure_lora_stack_entry(lora_path: Path, model_strength: float, clip_streng
     if not lora_dirs:
         raise RuntimeError("No ComfyUI LoRA directories are registered.")
 
-    generated_dir = ensure_dir(lora_dirs[0] / "0instant")
+    generated_dir = ensure_dir(lora_dirs[0] / "instant")
     target_path = generated_dir / lora_path.name
     if (
         not target_path.exists()
@@ -511,13 +513,14 @@ class InstantReferenceLoRA(io.ComfyNode):
                 io.Float.Input("model_strength", default=1.0),
                 io.Float.Input("clip_strength", default=1.0),
                 io.DynamicCombo.Input("profile", options=options, display_name="profile"),
+                io.String.Input("output_name", default=""),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
                 io.Clip.Output(display_name="clip"),
                 io.String.Output(display_name="lora_path"),
                 LoRAStack.Output(display_name="lora_stack"),
-                io.String.Output(display_name="tags"), # <--- 태그 출력 추가
+                io.String.Output(display_name="tags"),
             ],
         )
 
@@ -527,7 +530,7 @@ class InstantReferenceLoRA(io.ComfyNode):
         return profiles_fingerprint(profiles)
 
     @classmethod
-    def execute(cls, model, clip, images, model_strength, clip_strength, profile, tagging_options=None, train_options=None) -> io.NodeOutput:
+    def execute(cls, model, clip, images, model_strength, clip_strength, profile, tagging_options=None, train_options=None, output_name="") -> io.NodeOutput:
         return _execute_reference_lora(
             model,
             clip,
@@ -537,99 +540,103 @@ class InstantReferenceLoRA(io.ComfyNode):
             clip_strength=clip_strength,
             tagging_options=tagging_options,
             train_options=train_options,
+            output_name=output_name,
         )
 
 
-def _execute_reference_lora(model, clip, images, profile, model_strength=1.0, clip_strength=1.0, tagging_options=None, train_options=None) -> io.NodeOutput:
-        profile_key = profile["profile"]
-        selected_profile = profile_map(_plugin_root())[profile_key]
-        resolved_tagging = _tagging_options_from_input(tagging_options)
-        resolved_train = _train_options_from_input(train_options)
-        target_steps = _effective_max_train_steps(selected_profile, resolved_train)
-        model_slot = _primary_profile_slot(selected_profile, "MODEL")
-        if model_slot is None:
-            raise RuntimeError(f"Profile '{selected_profile.name}' must define a MODEL slot such as '{{{{model:MODEL}}}}'.")
-        checkpoint_path = _recover_model_checkpoint_path(model)
-        temp_image_hash = hash_tensor_batch(images)
-        paths = get_runtime_paths()
-        temp_run_dir = ensure_dir(paths.cache / f"_inflight_{temp_image_hash}")
-        temp_run_log = temp_run_dir / "run.log"
-        dataset_dir, image_hash, captions_hash, captions = _prepare_dataset(
-            images,
-            log_path=temp_run_log,
-            options=resolved_tagging,
-            target_steps=target_steps,
+def _execute_reference_lora(model, clip, images, profile, model_strength=1.0, clip_strength=1.0, tagging_options=None, train_options=None, output_name="") -> io.NodeOutput:
+    profile_key = profile["profile"]
+    selected_profile = profile_map(_plugin_root())[profile_key]
+    resolved_tagging = _tagging_options_from_input(tagging_options)
+    resolved_train = _train_options_from_input(train_options)
+    target_steps = _effective_max_train_steps(selected_profile, resolved_train)
+    model_slot = _primary_profile_slot(selected_profile, "MODEL")
+    if model_slot is None:
+        raise RuntimeError(f"Profile '{selected_profile.name}' must define a MODEL slot such as '{{{{model:MODEL}}}}'.")
+    checkpoint_path = _recover_model_checkpoint_path(model)
+    temp_image_hash = hash_tensor_batch(images)
+    paths = get_runtime_paths()
+    temp_run_dir = ensure_dir(paths.cache / f"_inflight_{temp_image_hash}")
+    temp_run_log = temp_run_dir / "run.log"
+    dataset_dir, image_hash, captions_hash, captions = _prepare_dataset(
+        images,
+        log_path=temp_run_log,
+        options=resolved_tagging,
+        target_steps=target_steps,
+    )
+
+    all_tags_text = "\n".join([v for k, v in captions.items()])
+
+    resolved_slots: dict[str, ResolvedSlot] = {}
+    for slot in selected_profile.slots:
+        if slot.slot_type == "MODEL":
+            resolved_slots[slot.name] = _resolve_slot(slot, model)
+            continue
+        if slot.slot_type == "CLIP":
+            resolved_slots[slot.name] = _resolve_slot(slot, clip)
+            continue
+        if slot.name not in profile:
+            raise RuntimeError(f"Profile '{selected_profile.name}' requires input '{slot.name}'.")
+        resolved_slots[slot.name] = _resolve_slot(slot, profile[slot.name])
+
+    cache_key = _cache_key(
+        checkpoint_path=checkpoint_path,
+        profile=selected_profile,
+        image_hash=image_hash,
+        captions_hash=captions_hash,
+        slots=resolved_slots,
+        tagging_options=resolved_tagging,
+        train_options=resolved_train,
+    )
+
+    run_dir = ensure_dir(paths.cache / cache_key)
+    run_log = run_dir / "run.log"
+    if temp_run_log != run_log:
+        _merge_run_log(temp_run_log, run_log)
+    output_dir = ensure_dir(paths.outputs / cache_key)
+    final_output_name = output_name.strip()
+    if not final_output_name:
+        final_output_name = resolved_train.output_name_override.strip()
+    if not final_output_name:
+        final_output_name = f"instant_{cache_key[:12]}"
+    output_name = final_output_name
+    manifest = run_dir / "manifest.json"
+    cached_lora = None if resolved_train.force_retrain else latest_safetensors(output_dir)
+
+    if cached_lora is None:
+        ensure_sd_scripts_environment(paths, log_path=run_log)
+        builtins = _builtins_for_run(dataset_dir, output_dir, output_name)
+        config_path = _write_resolved_config(selected_profile, resolved_slots, builtins, run_dir, resolved_train)
+        write_json(
+            manifest,
+            {
+                "cache_key": cache_key,
+                "checkpoint_path": checkpoint_path,
+                "profile": selected_profile.key,
+                "profile_file": str(selected_profile.file_path),
+                "captions": captions,
+                "tagging_options": resolved_tagging.__dict__,
+                "train_options": resolved_train.__dict__,
+                "resolved_slots": {name: slot.replacement for name, slot in resolved_slots.items()},
+                "config_path": str(config_path),
+            },
         )
+        comfy.model_management.unload_all_models()
+        soft_empty_cache = getattr(comfy.model_management, "soft_empty_cache", None)
+        if callable(soft_empty_cache):
+            soft_empty_cache()
+        cached_lora = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log)
 
-        # 2. 캡션 파일들의 내용을 하나의 문자열로 합치기 (출력용)
-        # 각 이미지별 태그를 줄바꿈하여 합칩니다. (파일명 제외)
-        all_tags_text = "\n".join([v for k, v in captions.items()])
-
-        resolved_slots: dict[str, ResolvedSlot] = {}
-        for slot in selected_profile.slots:
-            if slot.slot_type == "MODEL":
-                resolved_slots[slot.name] = _resolve_slot(slot, model)
-                continue
-            if slot.slot_type == "CLIP":
-                resolved_slots[slot.name] = _resolve_slot(slot, clip)
-                continue
-            if slot.name not in profile:
-                raise RuntimeError(f"Profile '{selected_profile.name}' requires input '{slot.name}'.")
-            resolved_slots[slot.name] = _resolve_slot(slot, profile[slot.name])
-
-        cache_key = _cache_key(
-            checkpoint_path=checkpoint_path,
-            profile=selected_profile,
-            image_hash=image_hash,
-            captions_hash=captions_hash,
-            slots=resolved_slots,
-            tagging_options=resolved_tagging,
-            train_options=resolved_train,
-        )
-
-        run_dir = ensure_dir(paths.cache / cache_key)
-        run_log = run_dir / "run.log"
-        if temp_run_log != run_log:
-            _merge_run_log(temp_run_log, run_log)
-        output_dir = ensure_dir(paths.outputs / cache_key)
-        output_name = f"instant_{cache_key[:12]}"
-        manifest = run_dir / "manifest.json"
-        cached_lora = None if resolved_train.force_retrain else latest_safetensors(output_dir)
-
-        if cached_lora is None:
-            ensure_sd_scripts_environment(paths, log_path=run_log)
-            builtins = _builtins_for_run(dataset_dir, output_dir, output_name)
-            config_path = _write_resolved_config(selected_profile, resolved_slots, builtins, run_dir, resolved_train)
-            write_json(
-                manifest,
-                {
-                    "cache_key": cache_key,
-                    "checkpoint_path": checkpoint_path,
-                    "profile": selected_profile.key,
-                    "profile_file": str(selected_profile.file_path),
-                    "captions": captions,
-                    "tagging_options": resolved_tagging.__dict__,
-                    "train_options": resolved_train.__dict__,
-                    "resolved_slots": {name: slot.replacement for name, slot in resolved_slots.items()},
-                    "config_path": str(config_path),
-                },
-            )
-            comfy.model_management.unload_all_models()
-            soft_empty_cache = getattr(comfy.model_management, "soft_empty_cache", None)
-            if callable(soft_empty_cache):
-                soft_empty_cache()
-            cached_lora = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log)
-
-        patched_model, patched_clip = _apply_lora(
-            model,
-            clip,
-            cached_lora,
-            float(model_strength),
-            float(clip_strength),
-        )
-        _record_last_lora(cached_lora)
-        lora_stack = _ensure_lora_stack_entry(cached_lora, float(model_strength), float(clip_strength))
-        return io.NodeOutput(patched_model, patched_clip, str(cached_lora), lora_stack, all_tags_text)
+    patched_model, patched_clip = _apply_lora(
+        model,
+        clip,
+        cached_lora,
+        float(model_strength),
+        float(clip_strength),
+    )
+    _record_last_lora(cached_lora)
+    lora_stack = _ensure_lora_stack_entry(cached_lora, float(model_strength), float(clip_strength))
+    return io.NodeOutput(patched_model, patched_clip, str(cached_lora), lora_stack, all_tags_text)
 
 
 class ReferenceTrainingExtension(ComfyExtension):
@@ -678,11 +685,13 @@ class InstantReferenceLoRAV1:
                 **_all_optional_profile_inputs(),
                 "tagging_options": ("TAGGING_OPTIONS",),
                 "train_options": ("TRAIN_OPTIONS",),
+                "output_name": ("STRING", {"default": ""}),
             },
         }
 
     def run(self, model, clip, images, model_strength, clip_strength, profile, tagging_options=None, train_options=None, **kwargs):
         payload = {"profile": profile}
+        output_name = kwargs.pop("output_name", "")
         payload.update(kwargs)
         output = _execute_reference_lora(
             model,
@@ -693,6 +702,7 @@ class InstantReferenceLoRAV1:
             clip_strength=clip_strength,
             tagging_options=tagging_options,
             train_options=train_options,
+            output_name=output_name,
         )
         return output.result
 
@@ -736,6 +746,7 @@ class TrainOptionsV1:
                     "network_dim_override": ("INT", {"default": 0, "min": 0, "max": 1024}),
                     "network_alpha_override": ("INT", {"default": 0, "min": 0, "max": 1024}),
                     "resolution_override": ("STRING", {"default": "", "multiline": False}),
+                    "output_name": ("STRING", {"default": "", "multiline": False}),
                     "gradient_checkpointing": ("BOOLEAN", {"default": True}),
                     "cache_latents": ("BOOLEAN", {"default": True}),
                     "cache_text_encoder_outputs": ("BOOLEAN", {"default": True}),
