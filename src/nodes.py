@@ -18,10 +18,12 @@ from comfy_api.latest import ComfyExtension, io
 
 from .profiles import ProfileDefinition, SlotSpec, load_profiles, profile_map, profiles_fingerprint, replace_profile_tokens
 from .runtime import (
+    IMAGE_EXTENSIONS,
     ensure_dir,
     ensure_sd_scripts_environment,
     export_images,
     get_runtime_paths,
+    hash_directory_images,
     hash_tensor_batch,
     hash_text,
     latest_safetensors,
@@ -72,6 +74,7 @@ class TrainOptions:
     gradient_checkpointing: bool = True
     cache_latents: bool = True
     cache_text_encoder_outputs: bool = True
+    save_every_n_steps: int = 0
     seed_override: int = -1
     force_retrain: bool = False
     output_name_override: str = ""
@@ -119,6 +122,7 @@ def _train_options_from_input(value: Any | None) -> TrainOptions:
         gradient_checkpointing=bool(value.get("gradient_checkpointing", True)),
         cache_latents=bool(value.get("cache_latents", True)),
         cache_text_encoder_outputs=bool(value.get("cache_text_encoder_outputs", True)),
+        save_every_n_steps=int(value.get("save_every_n_steps", 0)),
         seed_override=int(value.get("seed_override", -1)),
         force_retrain=bool(value.get("force_retrain", False)),
         output_name_override=str(value.get("output_name", "")),
@@ -285,23 +289,55 @@ def _prepare_dataset(
     log_path: Path,
     options: TaggingOptions,
     target_steps: int,
+    source_dir: Path | None = None,
 ) -> tuple[Path, str, str, dict[str, str]]:
     paths = get_runtime_paths()
-    image_hash = hash_tensor_batch(images)
+    
+    if source_dir:
+        image_files = []
+        for ext in IMAGE_EXTENSIONS:
+            image_files.extend(source_dir.glob(f"*{ext}"))
+            image_files.extend(source_dir.glob(f"*{ext.upper()}"))
+        
+        if not image_files:
+            raise RuntimeError(f"No supported image files found in {source_dir}")
+            
+        image_count = len(image_files)
+        image_hash = hash_directory_images(source_dir)
+        
+        # Tag in-place in the source directory as requested
+        _tag_dataset(paths, source_dir, log_path=log_path, options=options)
+        _apply_caption_options(source_dir, options)
+    else:
+        image_hash = hash_tensor_batch(images)
+        image_count = images.shape[0] if hasattr(images, "shape") and len(images.shape) > 0 else 1
+
     dataset_key = hash_text(f"{image_hash}|{_tagging_options_fingerprint(options)}|steps:{target_steps}")
     dataset_dir = ensure_dir(paths.datasets / dataset_key)
-    image_count = images.shape[0] if hasattr(images, "shape") and len(images.shape) > 0 else 1
     repeat_count = max(1, -(-target_steps // max(1, int(image_count))))
     train_subset_dir = ensure_dir(dataset_dir / f"{repeat_count}_reference")
-    export_images(images, train_subset_dir)
-    _tag_dataset(paths, train_subset_dir, log_path=log_path, options=options)
-    captions = _apply_caption_options(train_subset_dir, options)
+    
+    if source_dir:
+        # Copy files to the structured dataset directory
+        for img_path in image_files:
+            shutil.copy2(img_path, train_subset_dir / img_path.name)
+            txt_path = img_path.with_suffix(".txt")
+            if txt_path.exists():
+                shutil.copy2(txt_path, train_subset_dir / txt_path.name)
+    else:
+        export_images(images, train_subset_dir)
+        _tag_dataset(paths, train_subset_dir, log_path=log_path, options=options)
+        _apply_caption_options(train_subset_dir, options)
+
+    captions = read_caption_files(train_subset_dir)
     if not captions:
-        raise RuntimeError("WD tagging did not produce any caption files.")
+        raise RuntimeError("Dataset preparation did not produce any caption files.")
+        
     caption_digest = hashlib.blake2b(digest_size=4)
     for key, value in sorted(captions.items()):
         caption_digest.update(key.encode("utf-8"))
         caption_digest.update(value.encode("utf-8"))
+        
     return dataset_dir, image_hash, caption_digest.hexdigest(), captions
 
 
@@ -389,6 +425,8 @@ def _apply_train_options(config_text: str, options: TrainOptions) -> str:
     overrides["gradient_checkpointing"] = options.gradient_checkpointing
     overrides["cache_latents"] = options.cache_latents
     overrides["cache_text_encoder_outputs"] = options.cache_text_encoder_outputs
+    if options.save_every_n_steps > 0:
+        overrides["save_every_n_steps"] = options.save_every_n_steps
     if os.name == "nt":
         overrides["max_data_loader_n_workers"] = 0
         overrides["persistent_data_loader_workers"] = False
@@ -509,7 +547,8 @@ class InstantReferenceLoRA(io.ComfyNode):
             inputs=[
                 io.Model.Input("model"),
                 io.Clip.Input("clip"),
-                io.Image.Input("images"),
+                io.Image.Input("images").optional(),
+                io.String.Input("folder_path", default="").optional(),
                 io.Float.Input("model_strength", default=1.0),
                 io.Float.Input("clip_strength", default=1.0),
                 io.DynamicCombo.Input("profile", options=options, display_name="profile"),
@@ -530,12 +569,13 @@ class InstantReferenceLoRA(io.ComfyNode):
         return profiles_fingerprint(profiles)
 
     @classmethod
-    def execute(cls, model, clip, images, model_strength, clip_strength, profile, tagging_options=None, train_options=None, output_name="") -> io.NodeOutput:
+    def execute(cls, model, clip, images=None, folder_path="", model_strength=1.0, clip_strength=1.0, profile=None, tagging_options=None, train_options=None, output_name="") -> io.NodeOutput:
         return _execute_reference_lora(
             model,
             clip,
             images,
             profile,
+            folder_path=folder_path,
             model_strength=model_strength,
             clip_strength=clip_strength,
             tagging_options=tagging_options,
@@ -544,7 +584,7 @@ class InstantReferenceLoRA(io.ComfyNode):
         )
 
 
-def _execute_reference_lora(model, clip, images, profile, model_strength=1.0, clip_strength=1.0, tagging_options=None, train_options=None, output_name="") -> io.NodeOutput:
+def _execute_reference_lora(model, clip, images, profile, folder_path="", model_strength=1.0, clip_strength=1.0, tagging_options=None, train_options=None, output_name="") -> io.NodeOutput:
     profile_key = profile["profile"]
     selected_profile = profile_map(_plugin_root())[profile_key]
     resolved_tagging = _tagging_options_from_input(tagging_options)
@@ -554,7 +594,16 @@ def _execute_reference_lora(model, clip, images, profile, model_strength=1.0, cl
     if model_slot is None:
         raise RuntimeError(f"Profile '{selected_profile.name}' must define a MODEL slot such as '{{{{model:MODEL}}}}'.")
     checkpoint_path = _recover_model_checkpoint_path(model)
-    temp_image_hash = hash_tensor_batch(images)
+    
+    if folder_path and folder_path.strip():
+        source_dir = Path(folder_path.strip())
+        if not source_dir.exists() or not source_dir.is_dir():
+            raise RuntimeError(f"Specified folder_path does not exist or is not a directory: {folder_path}")
+        temp_image_hash = hash_directory_images(source_dir)
+    else:
+        source_dir = None
+        temp_image_hash = hash_tensor_batch(images)
+
     paths = get_runtime_paths()
     temp_run_dir = ensure_dir(paths.cache / f"_inflight_{temp_image_hash}")
     temp_run_log = temp_run_dir / "run.log"
@@ -563,6 +612,7 @@ def _execute_reference_lora(model, clip, images, profile, model_strength=1.0, cl
         log_path=temp_run_log,
         options=resolved_tagging,
         target_steps=target_steps,
+        source_dir=source_dir,
     )
 
     all_tags_text = "\n".join([v for k, v in captions.items()])
@@ -676,12 +726,13 @@ class InstantReferenceLoRAV1:
             "required": {
                 "model": ("MODEL",),
                 "clip": ("CLIP",),
-                "images": ("IMAGE",),
                 "model_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05}),
                 "clip_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05}),
                 "profile": ([profile.key for profile in profiles],),
             },
             "optional": {
+                "images": ("IMAGE",),
+                "folder_path": ("STRING", {"default": ""}),
                 **_all_optional_profile_inputs(),
                 "tagging_options": ("TAGGING_OPTIONS",),
                 "train_options": ("TRAIN_OPTIONS",),
@@ -689,7 +740,7 @@ class InstantReferenceLoRAV1:
             },
         }
 
-    def run(self, model, clip, images, model_strength, clip_strength, profile, tagging_options=None, train_options=None, **kwargs):
+    def run(self, model, clip, model_strength, clip_strength, profile, images=None, folder_path="", tagging_options=None, train_options=None, **kwargs):
         payload = {"profile": profile}
         output_name = kwargs.pop("output_name", "")
         payload.update(kwargs)
@@ -698,6 +749,7 @@ class InstantReferenceLoRAV1:
             clip,
             images,
             payload,
+            folder_path=folder_path,
             model_strength=model_strength,
             clip_strength=clip_strength,
             tagging_options=tagging_options,
@@ -750,6 +802,7 @@ class TrainOptionsV1:
                     "gradient_checkpointing": ("BOOLEAN", {"default": True}),
                     "cache_latents": ("BOOLEAN", {"default": True}),
                     "cache_text_encoder_outputs": ("BOOLEAN", {"default": True}),
+                    "save_every_n_steps": ("INT", {"default": 0, "min": 0, "max": 100000}),
                     "seed_override": ("INT", {"default": -1, "min": -1, "max": 2**31 - 1}),
                     "force_retrain": ("BOOLEAN", {"default": False}),
             }

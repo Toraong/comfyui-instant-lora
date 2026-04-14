@@ -293,7 +293,7 @@ def get_runtime_paths() -> RuntimePaths:
     lora_dirs = folder_paths.get_folder_paths("loras")
     if not lora_dirs:
         raise RuntimeError("No ComfyUI LoRA directories are registered.")
-    generated_loras = ensure_dir(Path(lora_dirs[0]) / "instant-reference-generated")
+    generated_loras = ensure_dir(Path(lora_dirs[0]) / "Anima")
     return RuntimePaths(
         root=root,
         sd_scripts=root / "sd-scripts",
@@ -318,8 +318,43 @@ def hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+
+def hash_directory_images(directory: Path) -> str:
+    if not directory.exists() or not directory.is_dir():
+        return "empty"
+    
+    digest = hashlib.sha256()
+    # Find all image files, sort them to ensure consistent hashing
+    files = []
+    for ext in IMAGE_EXTENSIONS:
+        files.extend(directory.glob(f"*{ext}"))
+        files.extend(directory.glob(f"*{ext.upper()}"))
+    
+    files.sort(key=lambda x: x.name)
+    
+    if not files:
+        return "empty"
+
+    for file_path in files:
+        digest.update(file_path.name.encode("utf-8"))
+        # We also check stat to see if the file changed without renaming
+        stat = file_path.stat()
+        digest.update(str(stat.st_mtime).encode("utf-8"))
+        digest.update(str(stat.st_size).encode("utf-8"))
+        
+    return digest.hexdigest()
+
+
 def hash_tensor_batch(images: Any) -> str:
-    array = images.detach().cpu().numpy()
+    if images is None:
+        return "none"
+    try:
+        array = images.detach().cpu().numpy()
+    except (AttributeError, ValueError):
+        return "none"
+    
     normalized = np.clip(array * 255.0, 0, 255).astype(np.uint8)
     digest = hashlib.sha256()
     digest.update(str(normalized.shape).encode("utf-8"))
