@@ -55,8 +55,7 @@ class ResolvedSlot:
 
 @dataclass(frozen=True)
 class TaggingOptions:
-    general_threshold: float = 0.35
-    character_threshold: float = 0.85
+    tags: str = ""
     prepend_tags: str = ""
     append_tags: str = ""
     exclude_tags: str = ""
@@ -100,8 +99,7 @@ def _tagging_options_from_input(value: Any | None) -> TaggingOptions:
     if not value:
         return TaggingOptions()
     return TaggingOptions(
-        general_threshold=float(value.get("general_threshold", 0.35)),
-        character_threshold=float(value.get("character_threshold", 0.85)),
+        tags=str(value.get("tags", "")),
         prepend_tags=str(value.get("prepend_tags", "")),
         append_tags=str(value.get("append_tags", "")),
         exclude_tags=str(value.get("exclude_tags", "")),
@@ -232,40 +230,7 @@ def _resolve_slot(slot: SlotSpec, raw_value: Any) -> ResolvedSlot:
     raise RuntimeError(f"Unsupported slot type: {slot.slot_type}")
 
 
-def _tag_dataset(paths, dataset_dir: Path, log_path: Path, options: TaggingOptions) -> None:
-    if any(dataset_dir.glob("*.txt")):
-        return
-    ensure_sd_scripts_environment(paths, log_path=log_path)
-    python_path = venv_python(paths.venv)
-    tagger_script = resolve_sd_scripts_file(paths, "tag_images_by_wd14_tagger.py")
-    tagger_model_dir = paths.sd_scripts / "wd14_tagger_model"
-    onnx_model_path = tagger_model_dir / "SmilingWolf_wd-v1-4-convnext-tagger-v2" / "model.onnx"
-    command = [
-        str(python_path),
-        str(tagger_script),
-        "--batch_size",
-        "1",
-        "--caption_extension",
-        ".txt",
-        "--general_threshold",
-        str(options.general_threshold),
-        "--character_threshold",
-        str(options.character_threshold),
-        "--model_dir",
-        str(tagger_model_dir),
-        "--onnx",
-        "--recursive",
-        str(dataset_dir),
-    ]
-    if options.remove_underscore:
-        command.append("--remove_underscore")
-    if options.exclude_tags.strip():
-        command.extend(["--undesired_tags", options.exclude_tags])
-    if options.replace_tags.strip():
-        command.extend(["--tag_replacement", options.replace_tags])
-    if not onnx_model_path.exists():
-        command.append("--force_download")
-    run_command(command, cwd=paths.sd_scripts, log_path=log_path)
+# Removed _tag_dataset to disable built-in wd tagger and its auto-installation.
 
 
 def _apply_caption_options(dataset_dir: Path, options: TaggingOptions) -> dict[str, str]:
@@ -305,8 +270,10 @@ def _prepare_dataset(
         image_count = len(image_files)
         image_hash = hash_directory_images(source_dir)
         
-        # Tag in-place in the source directory as requested
-        _tag_dataset(paths, source_dir, log_path=log_path, options=options)
+        # Write tagging options tags to source files
+        for img_path in image_files:
+            txt_path = img_path.with_suffix(".txt")
+            txt_path.write_text(options.tags, encoding="utf-8")
         _apply_caption_options(source_dir, options)
     else:
         image_hash = hash_tensor_batch(images)
@@ -326,7 +293,10 @@ def _prepare_dataset(
                 shutil.copy2(txt_path, train_subset_dir / txt_path.name)
     else:
         export_images(images, train_subset_dir)
-        _tag_dataset(paths, train_subset_dir, log_path=log_path, options=options)
+        for img_path in list(train_subset_dir.glob("*")):
+            if img_path.suffix.lower() in IMAGE_EXTENSIONS:
+                txt_path = img_path.with_suffix(".txt")
+                txt_path.write_text(options.tags, encoding="utf-8")
         _apply_caption_options(train_subset_dir, options)
 
     captions = read_caption_files(train_subset_dir)
@@ -769,8 +739,7 @@ class TaggingOptionsV1:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "general_threshold": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "character_threshold": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "tags": ("STRING", {"default": "", "multiline": True}),
                 "prepend_tags": ("STRING", {"default": "", "multiline": False}),
                 "append_tags": ("STRING", {"default": "", "multiline": False}),
                 "exclude_tags": ("STRING", {"default": "", "multiline": False}),
