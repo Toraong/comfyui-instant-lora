@@ -37,6 +37,7 @@ dependencies = [
     "safetensors==0.4.5",
     "schedulefree==1.4",
     "scipy==1.11.4",
+    "scikit-learn",
     "sentencepiece==0.2.1",
     "tensorboard",
     "timm==1.0.15",
