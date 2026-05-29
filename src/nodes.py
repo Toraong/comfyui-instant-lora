@@ -613,13 +613,13 @@ def _execute_reference_lora(model, clip, images, profile, folder_path="", model_
     run_log = run_dir / "run.log"
     if temp_run_log != run_log:
         _merge_run_log(temp_run_log, run_log)
-    output_dir = ensure_dir(paths.outputs / cache_key)
     final_output_name = output_name.strip()
     if not final_output_name:
         final_output_name = resolved_train.output_name_override.strip()
     if not final_output_name:
         final_output_name = f"instant_{cache_key[:12]}"
     output_name = final_output_name
+    output_dir = ensure_dir(paths.outputs / output_name)
     manifest = run_dir / "manifest.json"
     cached_lora = None if resolved_train.force_retrain else latest_safetensors(output_dir)
 
