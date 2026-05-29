@@ -29,7 +29,7 @@ if os.name == "nt":
     from ctypes import wintypes
 
 
-SETUP_VERSION = "12"
+SETUP_VERSION = "13"
 SD_SCRIPTS_REPO = "https://github.com/kohya-ss/sd-scripts.git"
 SD_SCRIPTS_COMMIT = "1a3ec9ea745fe9883551dfca5c947ea3d6aa68c7"
 
@@ -221,7 +221,8 @@ def resolve_runtime_python() -> str:
     if os.name == "nt":
         try:
             result = subprocess.run(
-                ["py", "-3.12", "-c", "import sys; print(sys.executable)"],
+            #   ["py", "-3.12", "-c", "import sys; print(sys.executable)"],
+                [sys.executable, "-c", "import sys; print(sys.executable)"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -518,7 +519,8 @@ def recreate_venv_if_needed(paths: RuntimePaths, target_python: str, uv: str, lo
         if paths.venv.exists():
             shutil.rmtree(paths.venv, ignore_errors=True)
         run_command(
-            [uv, "venv", "--python", target_python, "--system-site-packages", str(paths.venv)],
+        #   [uv, "venv", "--python", target_python, "--system-site-packages", str(paths.venv)],
+            [uv, "venv", "--python","3.12", "--system-site-packages", str(paths.venv)],
             cwd=paths.root,
             log_path=log_path,
         )
