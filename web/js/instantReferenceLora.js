@@ -230,43 +230,6 @@ async function syncProfileInputs(node) {
   node.setDirtyCanvas(true, true);
 }
 
-async function refreshCacheInfo(node) {
-  const clearCacheWidget = node.__instantReferenceLoraClearCacheWidget;
-  if (!clearCacheWidget) {
-    return;
-  }
-  const baseLabel = "Clear Cache";
-  if (node.__instantReferenceLoraRefreshingCache) {
-    return;
-  }
-  node.__instantReferenceLoraRefreshingCache = true;
-  clearCacheWidget.name = `${baseLabel} (...)`;
-  node.setDirtyCanvas(true, true);
-  try {
-    const payload = await fetchJson("/instant-reference-lora/cache-info");
-    clearCacheWidget.name = `${baseLabel} (${payload.total_human})`;
-  } catch (error) {
-    clearCacheWidget.name = `${baseLabel} (?)`;
-    showToast("error", "Instant Reference LoRA", error.message);
-  }
-  node.__instantReferenceLoraRefreshingCache = false;
-  node.setDirtyCanvas(true, true);
-}
-
-function startAutoCacheRefresh() {
-  if (cacheRefreshTimer) {
-    return;
-  }
-  cacheRefreshTimer = window.setInterval(() => {
-    const nodes = app.graph?._nodes || [];
-    for (const node of nodes) {
-      if (isTrainingNodeInstance(node)) {
-        refreshCacheInfo(node);
-      }
-    }
-  }, CACHE_REFRESH_INTERVAL_MS);
-}
-
 function ensureNodeWidgets(node) {
   if (node.__instantReferenceLoraWidgetsReady) {
     return;
@@ -286,24 +249,7 @@ function ensureNodeWidgets(node) {
     await downloadLora(node);
   }, { serialize: false });
 
-  const clearCacheWidget = node.addWidget("button", "Clear Cache (...)", null, async () => {
-    const confirmed = window.confirm("Clear the Instant Reference LoRA cache?");
-    if (!confirmed) {
-      return;
-    }
-    try {
-      const payload = await fetchJson("/instant-reference-lora/clear-cache", { method: "POST" });
-      showToast("warn", "Instant Reference LoRA", `Cache cleared. Remaining: ${payload.total_human}`);
-      await refreshCacheInfo(node);
-    } catch (error) {
-      showToast("error", "Instant Reference LoRA", error.message);
-    }
-  }, { serialize: false });
-  node.__instantReferenceLoraClearCacheWidget = clearCacheWidget;
-
-  refreshCacheInfo(node);
   scheduleProfileInputSync(node);
-  startAutoCacheRefresh();
 }
 
 app.registerExtension({
